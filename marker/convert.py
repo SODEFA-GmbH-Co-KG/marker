@@ -140,7 +140,16 @@ def convert_single_pdf(
     )
     flush_cuda_memory()
     out_meta["block_stats"]["equations"] = eq_stats
+    bbox_information = []
+    for page in pages:
+        for block in page.blocks:
+            bbox_information.append({
+                "bbox": block.bbox,
+                "pnum": block.pnum,
+                "text": block.prelim_text
+            })
 
+    out_meta["bbox_information"] = bbox_information
     # Extract images and figures
     if settings.EXTRACT_IMAGES:
         extract_images(doc, pages)
