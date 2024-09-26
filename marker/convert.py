@@ -1,11 +1,17 @@
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning) # Filter torch pytree user warnings
+
+warnings.filterwarnings(
+    "ignore", category=UserWarning
+)  # Filter torch pytree user warnings
 
 import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1" # For some reason, transformers decided to use .isin for a simple op, which is not supported on MPS
+
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = (
+    "1"  # For some reason, transformers decided to use .isin for a simple op, which is not supported on MPS
+)
 
 
-import pypdfium2 as pdfium # Needs to be at the top to avoid warnings
+import pypdfium2 as pdfium  # Needs to be at the top to avoid warnings
 from PIL import Image
 
 from marker.utils import flush_cuda_memory
@@ -25,7 +31,13 @@ from marker.cleaners.code import identify_code_blocks, indent_blocks
 from marker.cleaners.bullets import replace_bullets
 from marker.cleaners.headings import split_heading_blocks
 from marker.cleaners.fontstyle import find_bold_italic
-from marker.postprocessors.markdown import merge_spans, merge_lines, get_full_text
+from marker.postprocessors.markdown import (
+    merge_spans,
+    merge_lines,
+    get_full_text,
+    apply_markdown_to_block,
+)
+from marker.schema.merged import StyledBlock
 from marker.cleaners.text import cleanup_text
 from marker.images.extract import extract_images
 from marker.images.save import images_to_dict
@@ -35,15 +47,15 @@ from marker.settings import settings
 
 
 def convert_single_pdf(
-        fname: str,
-        model_lst: List,
-        max_pages: int = None,
-        start_page: int = None,
-        metadata: Optional[Dict] = None,
-        langs: Optional[List[str]] = None,
-        batch_multiplier: int = 1,
-        ocr_all_pages: bool = False
-) -> Tuple[str, Dict[str, Image.Image], Dict]:
+    fname: str,
+    model_lst: List,
+    max_pages: int = None,
+    start_page: int = None,
+    metadata: Optional[Dict] = None,
+    langs: Optional[List[str]] = None,
+    batch_multiplier: int = 1,
+    ocr_all_pages: bool = False,
+) -> Tuple[List[StyledBlock], Dict[str, Image.Image], Dict]:
     ocr_all_pages = ocr_all_pages or settings.OCR_ALL_PAGES
 
     if metadata:
@@ -61,21 +73,18 @@ def convert_single_pdf(
         "filetype": filetype,
     }
 
-    if filetype == "other": # We can't process this file
-        return "", {}, out_meta
+    if filetype == "other":  # We can't process this file
+        return [], {}, out_meta
 
     # Get initial text blocks from the pdf
     doc = pdfium.PdfDocument(fname)
-    pages, toc = get_text_blocks(
-        doc,
-        fname,
-        max_pages=max_pages,
-        start_page=start_page
+    pages, toc = get_text_blocks(doc, fname, max_pages=max_pages, start_page=start_page)
+    out_meta.update(
+        {
+            "toc": toc,
+            "pages": len(pages),
+        }
     )
-    out_meta.update({
-        "toc": toc,
-        "pages": len(pages),
-    })
 
     # Trim pages from doc to align with start page
     if start_page:
@@ -83,20 +92,29 @@ def convert_single_pdf(
             doc.del_page(0)
 
     # Unpack models from list
-    texify_model, layout_model, order_model, edit_model, detection_model, ocr_model = model_lst
+    texify_model, layout_model, order_model, edit_model, detection_model, ocr_model = (
+        model_lst
+    )
 
     # Identify text lines on pages
     surya_detection(doc, pages, detection_model, batch_multiplier=batch_multiplier)
     flush_cuda_memory()
 
     # OCR pages as needed
-    pages, ocr_stats = run_ocr(doc, pages, langs, ocr_model, batch_multiplier=batch_multiplier, ocr_all_pages=ocr_all_pages)
+    pages, ocr_stats = run_ocr(
+        doc,
+        pages,
+        langs,
+        ocr_model,
+        batch_multiplier=batch_multiplier,
+        ocr_all_pages=ocr_all_pages,
+    )
     flush_cuda_memory()
 
     out_meta["ocr_stats"] = ocr_stats
     if len([b for p in pages for b in p.blocks]) == 0:
         print(f"Could not extract any text blocks for {fname}")
-        return "", {}, out_meta
+        return [], {}, out_meta
 
     surya_layout(doc, pages, layout_model, batch_multiplier=batch_multiplier)
     flush_cuda_memory()
@@ -132,21 +150,16 @@ def convert_single_pdf(
             block.filter_bad_span_types()
 
     filtered, eq_stats = replace_equations(
-        doc,
-        pages,
-        texify_model,
-        batch_multiplier=batch_multiplier
+        doc, pages, texify_model, batch_multiplier=batch_multiplier
     )
     flush_cuda_memory()
     out_meta["block_stats"]["equations"] = eq_stats
     bbox_information = []
     for page in pages:
         for block in page.blocks:
-            bbox_information.append({
-                "bbox": block.bbox,
-                "pnum": block.pnum,
-                "text": block.prelim_text
-            })
+            bbox_information.append(
+                {"bbox": block.bbox, "pnum": block.pnum, "text": block.prelim_text}
+            )
 
     out_meta["bbox_information"] = bbox_information
     # Extract images and figures
@@ -157,26 +170,34 @@ def convert_single_pdf(
     split_heading_blocks(pages)
     find_bold_italic(pages)
 
-    # Copy to avoid changing original data
-    merged_lines = merge_spans(filtered)
-    text_blocks = merge_lines(merged_lines)
-    text_blocks = filter_common_titles(text_blocks)
-    full_text = get_full_text(text_blocks)
+    # Apply markdown styling to each block individually
+    styled_blocks = []
+    for page in pages:
+        for block in page.blocks:
+            styled_text = apply_markdown_to_block(block)
+            styled_block = StyledBlock(
+                text=styled_text,
+                bbox=block.bbox,
+                pnum=block.pnum,
+                block_type=block.block_type,
+            )
+            styled_blocks.append(styled_block)
 
     # Handle empty blocks being joined
-    full_text = cleanup_text(full_text)
+    styled_blocks = [block for block in styled_blocks if block.text.strip()]
 
     # Replace bullet characters with a -
-    full_text = replace_bullets(full_text)
+    for block in styled_blocks:
+        block.text = replace_bullets(block.text)
 
-    # Postprocess text with editor model
-    full_text, edit_stats = edit_full_text(
-        full_text,
-        edit_model,
-        batch_multiplier=batch_multiplier
-    )
+    # Postprocess text with editor model (if needed)
+    if edit_model:
+        for block in styled_blocks:
+            block.text, _ = edit_full_text(
+                block.text, edit_model, batch_multiplier=batch_multiplier
+            )
     flush_cuda_memory()
-    out_meta["postprocess_stats"] = {"edit": edit_stats}
+
     doc_images = images_to_dict(pages)
 
-    return full_text, doc_images, out_meta
+    return styled_blocks, doc_images, out_meta

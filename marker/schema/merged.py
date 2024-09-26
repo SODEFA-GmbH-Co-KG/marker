@@ -24,3 +24,10 @@ class MergedBlock(BboxElement):
 class FullyMergedBlock(BaseModel):
     text: str
     block_type: str
+
+
+class StyledBlock(BaseModel):
+    text: str
+    bbox: List[float]
+    pnum: int
+    block_type: str
