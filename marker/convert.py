@@ -55,7 +55,7 @@ def convert_single_pdf(
     langs: Optional[List[str]] = None,
     batch_multiplier: int = 1,
     ocr_all_pages: bool = False,
-) -> Tuple[List[StyledBlock], Dict[str, Image.Image], Dict]:
+) -> Tuple[str, List[StyledBlock], Dict[str, Image.Image], Dict]:
     ocr_all_pages = ocr_all_pages or settings.OCR_ALL_PAGES
 
     if metadata:
@@ -74,7 +74,7 @@ def convert_single_pdf(
     }
 
     if filetype == "other":  # We can't process this file
-        return [], {}, out_meta
+        return "", [], {}, out_meta
 
     # Get initial text blocks from the pdf
     doc = pdfium.PdfDocument(fname)
@@ -114,7 +114,7 @@ def convert_single_pdf(
     out_meta["ocr_stats"] = ocr_stats
     if len([b for p in pages for b in p.blocks]) == 0:
         print(f"Could not extract any text blocks for {fname}")
-        return [], {}, out_meta
+        return "", [], {}, out_meta
 
     surya_layout(doc, pages, layout_model, batch_multiplier=batch_multiplier)
     flush_cuda_memory()
@@ -198,6 +198,26 @@ def convert_single_pdf(
             )
     flush_cuda_memory()
 
+    # Generate full text using the provided implementation
+    merged_lines = merge_spans(filtered)
+    text_blocks = merge_lines(merged_lines)
+    text_blocks = filter_common_titles(text_blocks)
+    full_text = get_full_text(text_blocks)
+
+    # Handle empty blocks being joined
+    full_text = cleanup_text(full_text)
+
+    # Replace bullet characters with a -
+    full_text = replace_bullets(full_text)
+
+    # Postprocess text with editor model
+    if edit_model:
+        full_text, edit_stats = edit_full_text(
+            full_text, edit_model, batch_multiplier=batch_multiplier
+        )
+        out_meta["postprocess_stats"] = {"edit": edit_stats}
+    flush_cuda_memory()
+
     doc_images = images_to_dict(pages)
 
-    return styled_blocks, doc_images, out_meta
+    return full_text, styled_blocks, doc_images, out_meta
